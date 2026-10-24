@@ -177,6 +177,12 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
         updateKeyboardGrabState();
         break;
 
+    case KeyComboStreamMenu:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected stream menu combo");
+        Session::get()->openStreamMenu(false);
+        break;
+
     default:
         Q_UNREACHABLE();
     }
@@ -507,8 +513,10 @@ void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
     if (event->state == SDL_PRESSED) {
         m_KeysDown.insert(MAKE_KEYPRESS_STATE(keyCode, modifiers, flags));
     }
-    else {
-        m_KeysDown.remove(MAKE_KEYPRESS_STATE(keyCode, modifiers, flags));
+    else if (!m_KeysDown.remove(MAKE_KEYPRESS_STATE(keyCode, modifiers, flags))) {
+        // Don't send key ups for keys that we didn't send down, such as
+        // special combo keys or keys already raised by raiseAllKeys()
+        return;
     }
 
     LiSendKeyboardEvent2(keyCode,

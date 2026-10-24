@@ -147,6 +147,31 @@ void Session::arCleanup()
     s_ActiveSession->m_OpusDecoder = nullptr;
 }
 
+// Scales decoded samples by the stream menu volume (in percent)
+static void applyVolume(void* buffer, int sampleCount, IAudioRenderer::AudioFormat format, int volume)
+{
+    if (volume >= 100) {
+        return;
+    }
+
+    // A cubic curve makes the steps sound roughly even in loudness
+    float gain = volume / 100.0f;
+    gain = gain * gain * gain;
+
+    if (format == IAudioRenderer::AudioFormat::Float32NE) {
+        float* samples = (float*)buffer;
+        for (int i = 0; i < sampleCount; i++) {
+            samples[i] *= gain;
+        }
+    }
+    else {
+        short* samples = (short*)buffer;
+        for (int i = 0; i < sampleCount; i++) {
+            samples[i] = (short)(samples[i] * gain);
+        }
+    }
+}
+
 void Session::arDecodeAndPlaySample(char* sampleData, int sampleLength)
 {
     int samplesDecoded;
@@ -217,6 +242,10 @@ void Session::arDecodeAndPlaySample(char* sampleData, int sampleLength)
         if (samplesDecoded > 0) {
             SDL_assert(desiredBufferSize >= frameSize * samplesDecoded);
             desiredBufferSize = frameSize * samplesDecoded;
+
+            applyVolume(buffer, samplesDecoded * s_ActiveSession->m_ActiveAudioConfig.channelCount,
+                        s_ActiveSession->m_AudioRenderer->getAudioBufferFormat(),
+                        SDL_AtomicGet(&s_ActiveSession->m_AudioVolume));
         }
         else {
             desiredBufferSize = 0;

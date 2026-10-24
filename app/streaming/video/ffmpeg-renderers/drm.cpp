@@ -73,8 +73,14 @@ extern "C" {
 
 #include <Limelight.h>
 
+// Overlays that need their own plane to avoid composition mode. The stream menu
+// only gets a plane if a spare one exists, otherwise it's unsupported.
+#define REQUIRED_OVERLAY_PLANES (Overlay::OverlayStatusUpdate + 1)
+
+#include <algorithm>
 #include <map>
 #include <unordered_set>
+#include <vector>
 
 #ifdef HAVE_DRM_MASTER_HOOKS
 extern "C" {
@@ -158,6 +164,7 @@ DrmRenderer::DrmRenderer(AVHWDeviceType hwDeviceType, IFFmpegRenderer *backendRe
       m_VideoFormat(0),
       m_OverlayCompositionSurface(nullptr),
       m_OverlayRects{},
+      m_OverlaySurfaces{},
       m_Version(nullptr),
       m_HdrOutputMetadataBlobId(0),
       m_OutputRect{},
@@ -185,6 +192,12 @@ DrmRenderer::~DrmRenderer()
             struct drm_mode_destroy_dumb destroyBuf = {};
             destroyBuf.handle = m_SwFrame[i].handle;
             drmIoctl(m_DrmFd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroyBuf);
+        }
+    }
+
+    for (int i = 0; i < Overlay::OverlayMax; i++) {
+        if (m_OverlaySurfaces[i] != nullptr) {
+            SDL_FreeSurface(m_OverlaySurfaces[i]);
         }
     }
 
@@ -347,19 +360,40 @@ void DrmRenderer::prepareToRender()
                     m_VideoPlaneZpos);
         m_PropSetter.set(*zpos, m_VideoPlaneZpos, false);
     }
+    bool streamMenuPlaneOnTop = true;
+    uint64_t overlayZpos[Overlay::OverlayMax] = {};
     for (int i = 0; i < Overlay::OverlayMax; i++) {
         if (auto zpos = m_OverlayPlanes[i].property("zpos")) {
-            // This may result in multiple overlays having the same zpos, which
-            // means undefined ordering between the planes, but that's fine.
-            // The planes should never overlap anyway.
-            if (!zpos->isImmutable() && zpos->initialValue() <= m_VideoPlaneZpos) {
-                uint64_t newZpos = zpos->clamp(m_VideoPlaneZpos + 1);
+            // This may result in the debug and status overlays having the same zpos,
+            // which means undefined ordering between the planes, but that's fine.
+            // Those planes should never overlap anyway.
+            uint64_t minZpos = m_VideoPlaneZpos + 1;
+
+            // The stream menu can overlap the other overlays, so it must be above them
+            if (i == Overlay::OverlayStreamMenu) {
+                for (int j = 0; j < i; j++) {
+                    if (m_OverlayPlanes[j].isValid()) {
+                        minZpos = SDL_max(minZpos, overlayZpos[j] + 1);
+                    }
+                }
+            }
+
+            overlayZpos[i] = zpos->initialValue();
+            if (!zpos->isImmutable() && overlayZpos[i] < minZpos) {
+                uint64_t newZpos = zpos->clamp(minZpos);
 
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Moving overlay plane %u to zpos: %" PRIu64,
                             i,
                             newZpos);
                 m_PropSetter.set(*zpos, newZpos, false);
+                overlayZpos[i] = newZpos;
+            }
+
+            if (i == Overlay::OverlayStreamMenu && overlayZpos[i] < minZpos) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Unable to place stream menu plane above other overlays");
+                streamMenuPlaneOnTop = false;
             }
         }
     }
@@ -373,8 +407,10 @@ void DrmRenderer::prepareToRender()
     }
 
     // Enter overlay composition mode if we don't have enough planes to display all the
-    // possible overlays we might need, but we have at least one available
-    if (m_OverlayPlanes[0].isValid() && !m_OverlayPlanes[Overlay::OverlayMax - 1].isValid()) {
+    // possible overlays we might need, but we have at least one available. We also use
+    // composition if the stream menu has a plane but it can't be ordered above the others.
+    if (m_OverlayPlanes[0].isValid() &&
+            (!m_OverlayPlanes[REQUIRED_OVERLAY_PLANES - 1].isValid() || !streamMenuPlaneOnTop)) {
         enterOverlayCompositionMode();
     }
 
@@ -917,11 +953,15 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "Unable to find any suitable overlay planes");
     }
-    else if (overlayIndex < Overlay::OverlayMax) {
+    else if (overlayIndex < REQUIRED_OVERLAY_PLANES) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "Using overlay composition (%d of %d found)",
                     overlayIndex,
-                    Overlay::OverlayMax);
+                    REQUIRED_OVERLAY_PLANES);
+    }
+    else if (overlayIndex < Overlay::OverlayMax) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "No overlay plane available for the stream menu");
     }
 
     {
@@ -1452,79 +1492,78 @@ Fail:
     drmIoctl(m_DrmFd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroyBuf);
 }
 
-void DrmRenderer::blitOverlayToCompositionSurface(Overlay::OverlayType type, SDL_Surface* newSurface, SDL_Rect* overlayRect)
+// Blends a non-premultiplied ARGB8888 pixel over a premultiplied ARGB8888 pixel
+static inline uint32_t blendOverlayPixel(uint32_t dst, uint32_t src)
+{
+    uint32_t alpha = src >> 24;
+    if (alpha == 0) {
+        return dst;
+    }
+    else if (alpha == 0xFF) {
+        return src;
+    }
+
+    uint32_t invAlpha = 0xFF - alpha;
+    uint32_t result = (alpha + (((dst >> 24) * invAlpha + 127) / 255)) << 24;
+    for (int shift = 0; shift < 24; shift += 8) {
+        uint32_t srcChannel = (src >> shift) & 0xFF;
+        uint32_t dstChannel = (dst >> shift) & 0xFF;
+        result |= ((srcChannel * alpha + dstChannel * invAlpha + 127) / 255) << shift;
+    }
+
+    return result;
+}
+
+void DrmRenderer::composeOverlays(SDL_Rect dirtyRect)
 {
     SDL_assert(m_OverlayCompositionSurface);
+    SDL_assert(m_OverlayCompositionSurface->format->format == SDL_PIXELFORMAT_ARGB8888);
 
-    if (newSurface && overlayRect) {
-        // Disable blending of the source surface when blitting
-        SDL_SetSurfaceBlendMode(newSurface, SDL_BLENDMODE_NONE);
+    // Never touch anything outside of the composition surface
+    SDL_Rect surfaceRect = { 0, 0, m_OverlayCompositionSurface->w, m_OverlayCompositionSurface->h };
+    SDL_Rect clippedRect;
+    if (!SDL_IntersectRect(&dirtyRect, &surfaceRect, &clippedRect)) {
+        return;
+    }
+    dirtyRect = clippedRect;
 
-        // Premultiply alpha in place, so we can blit directly into the composition surface
-        // without having to read anything (which may be very costly due to UC/WC memory)
-        SDL_PremultiplyAlpha(newSurface->w, newSurface->h,
-                             newSurface->format->format, newSurface->pixels, newSurface->pitch,
-                             newSurface->format->format, newSurface->pixels, newSurface->pitch);
+    // Compose each row in system memory, then copy it into the composition surface at once.
+    // This avoids reading from the composition surface (which may be very costly due to
+    // UC/WC memory) and avoids flickering, which would be noticeable if we cleared the
+    // whole area first.
+    std::vector<uint32_t> composedRow(dirtyRect.w);
+    for (int y = dirtyRect.y; y < dirtyRect.y + dirtyRect.h; y++) {
+        std::fill(composedRow.begin(), composedRow.end(), 0);
 
-        // Compute the union of the current and previous overlay rects. Our draw operation
-        // will need to cover this entire area to ensure the old dirty area is covered.
-        SDL_Rect overlayUnionRect;
-        SDL_UnionRect(overlayRect, &m_OverlayRects[type], &overlayUnionRect);
+        // Overlays are drawn in ascending order of type, so the stream menu ends up on top
+        for (int i = 0; i < Overlay::OverlayMax; i++) {
+            SDL_Surface* surface = m_OverlaySurfaces[i];
+            const SDL_Rect& overlayRect = m_OverlayRects[i];
 
-        // If the new overlay completely covers the old overlay, blit it all at once
-        if (SDL_RectEquals(&overlayUnionRect, overlayRect)) {
-            SDL_BlitSurface(newSurface, nullptr, m_OverlayCompositionSurface, overlayRect);
-        }
-        else {
-            SDL_assert(newSurface->format->format == m_OverlayCompositionSurface->format->format);
+            if (surface == nullptr || y < overlayRect.y || y >= overlayRect.y + surface->h) {
+                continue;
+            }
 
-            // Draw the surface row-by-row to ensure we clear the dirty area from the previous surface
-            // without causing flickering, which would be noticeable if we cleared the whole area first.
-            for (int y = overlayUnionRect.y; y < overlayUnionRect.y + overlayUnionRect.h; y++) {
-                auto dstPixelRow =
-                    (uint8_t*)m_OverlayCompositionSurface->pixels +
-                    (y * m_OverlayCompositionSurface->pitch);
-                auto bpp = m_OverlayCompositionSurface->format->BytesPerPixel;
+            // Clip the row to both the overlay surface and the dirty area
+            int startX = SDL_max(overlayRect.x, dirtyRect.x);
+            int endX = SDL_min(overlayRect.x + surface->w, dirtyRect.x + dirtyRect.w);
 
-                if (y < overlayRect->y || y > overlayRect->y + overlayRect->h) {
-                    // Clear the whole row if the overlay doesn't intersect this row
-                    memset(dstPixelRow + (overlayUnionRect.x * bpp),
-                           0,
-                           overlayUnionRect.w * bpp);
-                }
-                else {
-                    auto srcPixelRow = (uint8_t*)newSurface->pixels + ((y - overlayRect->y) * newSurface->pitch);
-
-                    // Clear columns prior to the intersection
-                    SDL_assert(overlayRect->x >= overlayUnionRect.x);
-                    memset(dstPixelRow + (overlayUnionRect.x * bpp),
-                           0,
-                           (overlayRect->x - overlayUnionRect.x) * bpp);
-
-                    // Copy the overlay into the intersection
-                    memcpy(dstPixelRow + (overlayRect->x * bpp),
-                           srcPixelRow,
-                           overlayRect->w * bpp);
-
-                    // Clear columns after the intersection
-                    SDL_assert(overlayUnionRect.w >= overlayRect->w);
-                    memset(dstPixelRow + ((overlayRect->x + overlayRect->w) * bpp),
-                           0,
-                           (overlayUnionRect.w - overlayRect->w) * bpp);
-                }
+            auto srcPixelRow = (const uint32_t*)((const uint8_t*)surface->pixels + ((y - overlayRect.y) * surface->pitch));
+            for (int x = startX; x < endX; x++) {
+                composedRow[x - dirtyRect.x] = blendOverlayPixel(composedRow[x - dirtyRect.x],
+                                                                 srcPixelRow[x - overlayRect.x]);
             }
         }
 
-        // Dirty the modified portion of the plane
-        m_PropSetter.damagePlane(m_OverlayPlanes[0], overlayUnionRect);
+        memcpy((uint8_t*)m_OverlayCompositionSurface->pixels +
+                   (y * m_OverlayCompositionSurface->pitch) +
+                   (dirtyRect.x * sizeof(uint32_t)),
+               composedRow.data(),
+               dirtyRect.w * sizeof(uint32_t));
     }
-    else {
-        // Clear the pixels where this overlay was drawn before
-        SDL_FillRect(m_OverlayCompositionSurface, &m_OverlayRects[type], 0);
 
-        // Dirty the modified portion of the plane
-        m_PropSetter.damagePlane(m_OverlayPlanes[0], m_OverlayRects[type]);
-    }
+    // Dirty the modified portion of the plane
+    m_PropSetter.damagePlane(m_OverlayPlanes[0], dirtyRect);
 }
 
 void DrmRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
@@ -1541,17 +1580,30 @@ void DrmRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
         return;
     }
 
+    // The stream menu has no fallback plane outside of composition mode
+    if (type == Overlay::OverlayStreamMenu && !m_OverlayCompositionSurface && !m_OverlayPlanes[type].isValid()) {
+        return;
+    }
+
     // Don't upload if the overlay is disabled
     if (!Session::get()->getOverlayManager().isOverlayEnabled(type)) {
+        if (m_OverlaySurfaces[type] != nullptr) {
+            SDL_FreeSurface(m_OverlaySurfaces[type]);
+            m_OverlaySurfaces[type] = nullptr;
+        }
+
         // Turn the overlay plane off when transitioning from enabled to disabled
         if (m_OverlayRects[type].w || m_OverlayRects[type].h) {
+            SDL_Rect oldOverlayRect = m_OverlayRects[type];
+            memset(&m_OverlayRects[type], 0, sizeof(m_OverlayRects[type]));
+
             if (m_OverlayCompositionSurface) {
-                blitOverlayToCompositionSurface(type, nullptr, nullptr);
+                // Redraw the old area with whatever other overlays remain there
+                composeOverlays(oldOverlayRect);
             }
             else if (m_OverlayPlanes[type].isValid()) {
                 m_PropSetter.disablePlane(m_OverlayPlanes[type]);
             }
-            memset(&m_OverlayRects[type], 0, sizeof(m_OverlayRects[type]));
         }
 
         return;
@@ -1562,6 +1614,7 @@ void DrmRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
     if (newSurface != nullptr) {
         uint32_t dumbBuffer, fbId;
         SDL_Rect overlayRect;
+        bool enteredCompositionMode = false;
 
         if (type == Overlay::OverlayStatusUpdate) {
             // Bottom Left
@@ -1572,6 +1625,11 @@ void DrmRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
             // Top left
             overlayRect.x = 0;
             overlayRect.y = 0;
+        }
+        else if (type == Overlay::OverlayStreamMenu) {
+            // Center
+            overlayRect.x = SDL_max(0, (m_OutputRect.w - newSurface->w) / 2);
+            overlayRect.y = SDL_max(0, (m_OutputRect.h - newSurface->h) / 2);
         }
 
         overlayRect.w = newSurface->w;
@@ -1601,6 +1659,7 @@ void DrmRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
                     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                                 "Switching to overlay composition mode after commit failure");
                     enterOverlayCompositionMode();
+                    enteredCompositionMode = true;
 
                     // Free the original uploaded FB and dumb buffer
                     drmModeRmFB(m_DrmFd, fbId);
@@ -1611,22 +1670,57 @@ void DrmRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
             }
         }
 
-        // If we're in overlay composition mode, blit this overlay into the composition surface
-        if (m_OverlayCompositionSurface) {
-            blitOverlayToCompositionSurface(type, newSurface, &overlayRect);
-        }
-        else {
-            // Otherwise queue the plane flip with the new FB
+        // If we tried to enter composition mode, the FB has already been freed
+        if (!m_OverlayCompositionSurface && !enteredCompositionMode) {
+            // Queue the plane flip with the new FB
             //
             // NB: This takes ownership of the FB and dumb buffer, even on failure
-            m_PropSetter.flipPlane(m_OverlayCompositionSurface ? m_OverlayPlanes[0] : m_OverlayPlanes[type],
-                                   fbId, dumbBuffer);
+            m_PropSetter.flipPlane(m_OverlayPlanes[type], fbId, dumbBuffer);
         }
 
+        // Keep the latest surface of each overlay, so the composition surface can
+        // be redrawn from all of them when any one of them changes.
+        if (newSurface->format->format != SDL_PIXELFORMAT_ARGB8888) {
+            SDL_Surface* convertedSurface = SDL_ConvertSurfaceFormat(newSurface, SDL_PIXELFORMAT_ARGB8888, 0);
+            SDL_FreeSurface(newSurface);
+            newSurface = convertedSurface;
+        }
+        if (m_OverlaySurfaces[type] != nullptr) {
+            SDL_FreeSurface(m_OverlaySurfaces[type]);
+        }
+        m_OverlaySurfaces[type] = newSurface;
+
+        // The union of the current and previous overlay rects must be redrawn
+        SDL_Rect dirtyRect;
+        SDL_UnionRect(&overlayRect, &m_OverlayRects[type], &dirtyRect);
         memcpy(&m_OverlayRects[type], &overlayRect, sizeof(overlayRect));
 
-        SDL_FreeSurface(newSurface);
+        // If we're in overlay composition mode, draw this overlay into the composition surface
+        if (m_OverlayCompositionSurface) {
+            if (enteredCompositionMode) {
+                // The other overlays were on their own planes, so redraw everything
+                dirtyRect = { 0, 0, m_OverlayCompositionSurface->w, m_OverlayCompositionSurface->h };
+            }
+
+            composeOverlays(dirtyRect);
+        }
     }
+}
+
+bool DrmRenderer::supportsOverlay(Overlay::OverlayType type)
+{
+    std::lock_guard lg { m_OverlayLock };
+
+    if (!m_PropSetter.isAtomic() || !m_OverlayPlanes[0].isValid()) {
+        return false;
+    }
+
+    // The stream menu needs a plane of its own or composition mode
+    if (type == Overlay::OverlayStreamMenu) {
+        return m_OverlayCompositionSurface != nullptr || m_OverlayPlanes[type].isValid();
+    }
+
+    return true;
 }
 
 bool DrmRenderer::addFbForFrame(AVFrame *frame, uint32_t* newFbId, bool testMode)

@@ -135,6 +135,11 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     m_SpecialKeyCombos[KeyComboToggleKeyboardGrab].scanCode = SDL_SCANCODE_K;
     m_SpecialKeyCombos[KeyComboToggleKeyboardGrab].enabled = WMUtils::isRunningDesktopEnvironment();
 
+    m_SpecialKeyCombos[KeyComboStreamMenu].keyCombo = KeyComboStreamMenu;
+    m_SpecialKeyCombos[KeyComboStreamMenu].keyCode = SDLK_o;
+    m_SpecialKeyCombos[KeyComboStreamMenu].scanCode = SDL_SCANCODE_O;
+    m_SpecialKeyCombos[KeyComboStreamMenu].enabled = true;
+
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);
 
@@ -289,6 +294,69 @@ void SdlInputHandler::notifyFocusGained()
 {
 }
 
+void SdlInputHandler::raiseAllInput()
+{
+    raiseAllKeys();
+
+    // Cancel touch gestures before releasing the mouse buttons they may hold down
+    SDL_RemoveTimer(m_LongPressTimer);
+    m_LongPressTimer = 0;
+    SDL_RemoveTimer(m_LeftButtonReleaseTimer);
+    m_LeftButtonReleaseTimer = 0;
+    SDL_RemoveTimer(m_RightButtonReleaseTimer);
+    m_RightButtonReleaseTimer = 0;
+    SDL_RemoveTimer(m_DragTimer);
+    m_DragTimer = 0;
+    m_DragButton = 0;
+    m_NumFingersDown = 0;
+    SDL_zero(m_TouchDownEvent);
+    m_TouchesDown.clear();
+
+    if (LiGetHostFeatureFlags() & LI_FF_PEN_TOUCH_EVENTS) {
+        LiSendTouchEvent(LI_TOUCH_EVENT_CANCEL_ALL, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, LI_ROT_UNKNOWN);
+        LiSendPenEvent(LI_TOUCH_EVENT_CANCEL_ALL, LI_TOOL_TYPE_UNKNOWN, 0, 0.0f, 0.0f, 0.0f,
+                       0.0f, 0.0f, LI_ROT_UNKNOWN, LI_TILT_UNKNOWN);
+    }
+
+    // Release every mouse button, since the button up events for buttons pressed
+    // by the mouse, touch, or gamepad mouse emulation may never reach us.
+    // This covers swapped mouse buttons too.
+    static const int k_MouseButtons[] = {
+        BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
+    };
+    for (int button : k_MouseButtons) {
+        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, button);
+    }
+
+    // Reset all gamepads, both locally and on the host
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        GamepadState* state = &m_GamepadState[i];
+        if (state->controller == nullptr) {
+            continue;
+        }
+
+        // Mouse emulation stays active, but a Start long press must start over
+        state->buttons = 0;
+        state->lastStartDownTime = 0;
+        state->lsX = state->lsY = 0;
+        state->rsX = state->rsY = 0;
+        state->lt = state->rt = 0;
+        state->emulatedClickpadButtonDown = false;
+        LiSendMultiControllerEvent(state->index, m_GamepadMask,
+                                   0, 0, 0, 0, 0, 0, 0);
+
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+        for (int touchpad = 0; touchpad < (int)SDL_arraysize(state->touchpadFingersDown); touchpad++) {
+            if (state->touchpadFingersDown[touchpad] != 0) {
+                LiSendControllerTouchEvent2((uint8_t)state->index, LI_TOUCH_EVENT_CANCEL_ALL,
+                                            (uint8_t)touchpad, 0, 0.0f, 0.0f, 0.0f);
+                state->touchpadFingersDown[touchpad] = 0;
+            }
+        }
+#endif
+    }
+}
+
 bool SdlInputHandler::isCaptureActive()
 {
     if (SDL_GetRelativeMouseMode()) {
@@ -420,6 +488,20 @@ void SdlInputHandler::handleTouchFingerEvent(SDL_TouchFingerEvent* event)
     // to tell them apart.
     return;
 #endif
+
+    // Drop events for contacts that we didn't see go down or that raiseAllInput() cancelled
+    QPair<SDL_TouchID, SDL_FingerID> touch(event->touchId, event->fingerId);
+    if (event->type == SDL_FINGERDOWN) {
+        m_TouchesDown.insert(touch);
+    }
+    else if (event->type == SDL_FINGERUP) {
+        if (!m_TouchesDown.remove(touch)) {
+            return;
+        }
+    }
+    else if (!m_TouchesDown.contains(touch)) {
+        return;
+    }
 
     if (m_AbsoluteTouchMode) {
         handleAbsoluteFingerEvent(event);

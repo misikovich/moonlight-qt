@@ -41,6 +41,7 @@ VAAPIRenderer::VAAPIRenderer(int decoderSelectionPass)
     SDL_zero(m_OverlayImage);
     SDL_zero(m_OverlaySubpicture);
     SDL_zero(m_OverlayFormat);
+    m_OverlayFormatFlags = 0;
 }
 
 VAAPIRenderer::~VAAPIRenderer()
@@ -532,6 +533,7 @@ VAAPIRenderer::initialize(PDECODER_PARAMETERS params)
 
                 // If we made it here, we found a format that works for us
                 m_OverlayFormat = formats[i];
+                m_OverlayFormatFlags = flags[i];
 
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Selected overlay subpicture format: %c%c%c%c8888",
@@ -761,8 +763,8 @@ void VAAPIRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
             overlayRect.x = 0;
             overlayRect.y = -newSurface->h;
         }
-        else if (type == Overlay::OverlayDebug) {
-            // Top left
+        else {
+            // Top left (the stream menu is centered at render time)
             overlayRect.x = 0;
             overlayRect.y = 0;
         }
@@ -845,18 +847,44 @@ VAAPIRenderer::renderFrame(AVFrame* frame)
         for (int type = 0; type < Overlay::OverlayMax; type++) {
             VAStatus status;
 
-            if (m_OverlaySubpicture[type] == 0) {
+            // Don't draw overlays that have been disabled but not yet freed
+            if (m_OverlaySubpicture[type] == 0 ||
+                    !Session::get()->getOverlayManager().isOverlayEnabled((Overlay::OverlayType)type)) {
                 continue;
             }
 
             SDL_Rect overlayRect = m_OverlayRect[type];
+            unsigned int subpictureFlags = 0;
 
-            // Negative values are relative to the other side of the window
-            if (overlayRect.x < 0) {
-                overlayRect.x += windowWidth;
+            if (type == Overlay::OverlayStreamMenu) {
+                // The stream menu must be drawn unscaled and centered in the window,
+                // since that's where mouse input is hit-tested.
+                overlayRect.x = (windowWidth - overlayRect.w) / 2;
+                overlayRect.y = (windowHeight - overlayRect.h) / 2;
+
+                if (m_OverlayFormatFlags & VA_SUBPICTURE_DESTINATION_IS_SCREEN_COORD) {
+                    subpictureFlags |= VA_SUBPICTURE_DESTINATION_IS_SCREEN_COORD;
+                }
+                else if (dst.w <= 0 || dst.h <= 0) {
+                    continue;
+                }
+                else {
+                    // The destination is in video surface coordinates, which vaPutSurface()
+                    // will scale from src to dst, so apply the inverse transformation here.
+                    overlayRect.x = (overlayRect.x - dst.x) * src.w / dst.w;
+                    overlayRect.y = (overlayRect.y - dst.y) * src.h / dst.h;
+                    overlayRect.w = overlayRect.w * src.w / dst.w;
+                    overlayRect.h = overlayRect.h * src.h / dst.h;
+                }
             }
-            if (overlayRect.y < 0) {
-                overlayRect.y += windowHeight;
+            else {
+                // Negative values are relative to the other side of the window
+                if (overlayRect.x < 0) {
+                    overlayRect.x += windowWidth;
+                }
+                if (overlayRect.y < 0) {
+                    overlayRect.y += windowHeight;
+                }
             }
 
             status = vaAssociateSubpicture(vaDeviceContext->display,
@@ -871,7 +899,7 @@ VAAPIRenderer::renderFrame(AVFrame* frame)
                                            overlayRect.y,
                                            overlayRect.w,
                                            overlayRect.h,
-                                           0);
+                                           subpictureFlags);
             if (status == VA_STATUS_SUCCESS) {
                 // Take temporary ownership of the overlay to prevent notifyOverlayUpdated()
                 // from freeing them frum underneath us. We need to release the lock while
@@ -921,8 +949,12 @@ VAAPIRenderer::renderFrame(AVFrame* frame)
                              status);
             }
 
+            // If the overlay was disabled while we were unlocked, notifyOverlayUpdated() had nothing
+            // to free, so we must free what we took ownership of rather than restoring it.
+            bool overlayEnabled = Session::get()->getOverlayManager().isOverlayEnabled((Overlay::OverlayType)type);
+
             // If a new subpicture was populated while we were unlocked, free the old one we took ownership of
-            if (m_OverlaySubpicture[type] != 0) {
+            if (m_OverlaySubpicture[type] != 0 || !overlayEnabled) {
                 status = vaDestroySubpicture(vaDeviceContext->display, associatedOverlaySubpictures[type]);
                 if (status != VA_STATUS_SUCCESS) {
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -936,7 +968,7 @@ VAAPIRenderer::renderFrame(AVFrame* frame)
             }
 
             // If a new image was populated while we were unlocked, free the one old we took ownership of
-            if (m_OverlayImage[type].image_id != 0) {
+            if (m_OverlayImage[type].image_id != 0 || !overlayEnabled) {
                 status = vaDestroyImage(vaDeviceContext->display, associatedOverlayImages[type].image_id);
                 if (status != VA_STATUS_SUCCESS) {
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,

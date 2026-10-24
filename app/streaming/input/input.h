@@ -5,6 +5,9 @@
 
 #include "SDL_compat.h"
 
+#include <QPair>
+#include <QSet>
+
 struct GamepadState {
     SDL_GameController* controller;
     SDL_JoystickID jsId;
@@ -30,6 +33,8 @@ struct GamepadState {
     uint8_t accelReportPeriodMs;
     float lastAccelEventData[SDL_arraysize(SDL_ControllerSensorEvent::data)];
     uint32_t lastAccelEventTime;
+
+    uint32_t touchpadFingersDown[2];
 #endif
 
     int buttons;
@@ -134,6 +139,8 @@ public:
 
     void raiseAllKeys();
 
+    void raiseAllInput();
+
     void notifyMouseLeave();
 
     void notifyFocusLost();
@@ -168,6 +175,7 @@ private:
         KeyComboTogglePointerRegionLock,
         KeyComboQuitAndExit,
         KeyComboToggleKeyboardGrab,
+        KeyComboStreamMenu,
         KeyComboMax
     };
 
@@ -249,6 +257,7 @@ private:
     SDL_TimerID m_DragTimer;
     char m_DragButton;
     int m_NumFingersDown;
+    QSet<QPair<SDL_TouchID, SDL_FingerID>> m_TouchesDown;
 
     static const int k_ButtonMap[];
 };

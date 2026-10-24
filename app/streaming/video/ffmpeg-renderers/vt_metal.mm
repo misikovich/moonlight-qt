@@ -538,6 +538,11 @@ public:
                     renderRect.x = 0;
                     renderRect.y = m_LastDrawableHeight - overlayTexture.height;
                 }
+                else if (i == Overlay::OverlayStreamMenu) {
+                    // Center
+                    renderRect.x = (m_LastDrawableWidth - (int)overlayTexture.width) / 2;
+                    renderRect.y = (m_LastDrawableHeight - (int)overlayTexture.height) / 2;
+                }
 
                 renderRect.w = overlayTexture.width;
                 renderRect.h = overlayTexture.height;

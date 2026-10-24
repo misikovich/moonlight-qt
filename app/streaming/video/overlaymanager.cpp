@@ -15,6 +15,9 @@ OverlayManager::OverlayManager() :
     m_Overlays[OverlayType::OverlayStatusUpdate].color = {0xCC, 0x00, 0x00, 0xFF};
     m_Overlays[OverlayType::OverlayStatusUpdate].fontSize = 36;
 
+    // The stream menu draws its own surfaces rather than using overlay text
+    m_Overlays[OverlayType::OverlayStreamMenu].prerendered = true;
+
     // While TTF will usually not be initialized here, it is valid for that not to
     // be the case, since Session destruction is deferred and could overlap with
     // the lifetime of a new Session object.
@@ -81,6 +84,22 @@ SDL_Surface* OverlayManager::getUpdatedOverlaySurface(OverlayType type)
     return (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, nullptr);
 }
 
+void OverlayManager::updateOverlaySurface(OverlayType type, SDL_Surface* surface)
+{
+    SDL_assert(m_Overlays[type].prerendered);
+
+    // Takes ownership of the surface
+    SDL_Surface* oldSurface = (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, surface);
+
+    if (m_Overlays[type].enabled && m_Renderer != nullptr) {
+        m_Renderer->notifyOverlayUpdated(type);
+    }
+
+    if (oldSurface != nullptr) {
+        SDL_FreeSurface(oldSurface);
+    }
+}
+
 void OverlayManager::setOverlayTextUpdated(OverlayType type)
 {
     // Only update the overlay state if it's enabled. If it's not enabled,
@@ -116,9 +135,29 @@ void OverlayManager::setOverlayRenderer(IOverlayRenderer* renderer)
     m_Renderer = renderer;
 }
 
+bool OverlayManager::isOverlaySupported(OverlayType type)
+{
+    return m_Renderer != nullptr && m_Renderer->supportsOverlay(type);
+}
+
 void OverlayManager::notifyOverlayUpdated(OverlayType type)
 {
     if (m_Renderer == nullptr) {
+        return;
+    }
+
+    // Pre-rendered overlays supply their own surface via updateOverlaySurface()
+    if (m_Overlays[type].prerendered) {
+        SDL_Surface* oldSurface = nullptr;
+        if (!m_Overlays[type].enabled) {
+            oldSurface = (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, nullptr);
+        }
+
+        m_Renderer->notifyOverlayUpdated(type);
+
+        if (oldSurface != nullptr) {
+            SDL_FreeSurface(oldSurface);
+        }
         return;
     }
 
