@@ -342,6 +342,11 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
         }
     }
     else {
+        if (!(state->buttons & k_ButtonMap[event->button])) {
+            // Ignore releases for buttons we didn't see go down (or that raiseAllInput() released)
+            return;
+        }
+
         state->buttons &= ~k_ButtonMap[event->button];
 
         if (event->button == SDL_CONTROLLER_BUTTON_START) {
@@ -417,6 +422,20 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
         return;
     }
 
+    // Handle Select+L1+R1+Y as a gamepad stream menu combo
+    if (state->buttons == (BACK_FLAG | LB_FLAG | RB_FLAG | Y_FLAG)) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected stream menu gamepad combo");
+
+        // Clear buttons down on this gamepad
+        LiSendMultiControllerEvent(state->index, m_GamepadMask,
+                                   0, 0, 0, 0, 0, 0, 0);
+
+        // Opening the menu resets all input on the host
+        Session::get()->openStreamMenu(true);
+        return;
+    }
+
     // Only send the gamepad state to the host if it's not in mouse emulation mode
     if (state->mouseEmulationTimer == 0) {
         sendGamepadState(state);
@@ -467,15 +486,33 @@ void SdlInputHandler::handleControllerTouchpadEvent(SDL_ControllerTouchpadEvent*
         return;
     }
 
+    // Only touchpad indices 0 and 1 are supported by the protocol
+    if (event->touchpad < 0 || event->touchpad >= (int)SDL_arraysize(state->touchpadFingersDown) ||
+            event->finger < 0 || event->finger >= 32) {
+        return;
+    }
+
+    // Track contacts to drop events for those cancelled by raiseAllInput()
+    uint32_t& fingersDown = state->touchpadFingersDown[event->touchpad];
+    uint32_t fingerFlag = 1U << event->finger;
+
     uint8_t eventType;
     switch (event->type) {
     case SDL_CONTROLLERTOUCHPADDOWN:
         eventType = LI_TOUCH_EVENT_DOWN;
+        fingersDown |= fingerFlag;
         break;
     case SDL_CONTROLLERTOUCHPADUP:
+        if (!(fingersDown & fingerFlag)) {
+            return;
+        }
         eventType = LI_TOUCH_EVENT_UP;
+        fingersDown &= ~fingerFlag;
         break;
     case SDL_CONTROLLERTOUCHPADMOTION:
+        if (!(fingersDown & fingerFlag)) {
+            return;
+        }
         eventType = LI_TOUCH_EVENT_MOVE;
         break;
     default:

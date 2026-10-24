@@ -11,6 +11,7 @@ namespace Overlay {
 enum OverlayType {
     OverlayDebug,
     OverlayStatusUpdate,
+    OverlayStreamMenu,
     OverlayMax
 };
 
@@ -20,6 +21,10 @@ public:
     virtual ~IOverlayRenderer() = default;
 
     virtual void notifyOverlayUpdated(OverlayType type) = 0;
+
+    virtual bool supportsOverlay(OverlayType) {
+        return true;
+    }
 };
 
 class OverlayManager
@@ -37,8 +42,10 @@ public:
     SDL_Color getOverlayColor(OverlayType type);
     int getOverlayFontSize(OverlayType type);
     SDL_Surface* getUpdatedOverlaySurface(OverlayType type);
+    void updateOverlaySurface(OverlayType type, SDL_Surface* surface);
 
     void setOverlayRenderer(IOverlayRenderer* renderer);
+    bool isOverlaySupported(OverlayType type);
 
 private:
     void notifyOverlayUpdated(OverlayType type);
@@ -46,6 +53,7 @@ private:
 
     struct {
         bool enabled;
+        bool prerendered;
         int fontSize;
         SDL_Color color;
         char text[1024];

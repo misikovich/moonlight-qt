@@ -436,9 +436,20 @@ public:
 
     virtual void notifyOverlayUpdated(Overlay::OverlayType type) override
     {
+        // The stream menu is a pre-rendered image which can't be shown in a text field
+        if (type == Overlay::OverlayStreamMenu) {
+            return;
+        }
+
         // We must do the actual UI updates on the main thread, so queue an
         // async callback on the main thread via GCD to do the UI update.
         dispatch_async(dispatch_get_main_queue(), m_OverlayUpdateBlocks[type]);
+    }
+
+    virtual bool supportsOverlay(Overlay::OverlayType type) override
+    {
+        // Pre-rendered overlays can't be shown in a text field
+        return type != Overlay::OverlayStreamMenu;
     }
 
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary**) override

@@ -19,6 +19,9 @@ public:
     virtual QSize getDecoderMaxResolution() override;
     virtual int submitDecodeUnit(PDECODE_UNIT du) override;
     virtual void notifyOverlayUpdated(Overlay::OverlayType) override;
+    virtual bool supportsOverlay(Overlay::OverlayType type) override {
+        return type == Overlay::OverlayStatusUpdate;
+    }
 
     // Unused since rendering is done directly from the decode thread
     virtual void renderFrameOnMainThread() override {}

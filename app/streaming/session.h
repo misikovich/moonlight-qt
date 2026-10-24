@@ -10,6 +10,7 @@
 #include "video/decoder.h"
 #include "audio/renderers/renderer.h"
 #include "video/overlaymanager.h"
+#include "streammenu.h"
 
 class SupportedVideoFormatList : public QList<int>
 {
@@ -104,6 +105,10 @@ public:
     Q_INVOKABLE bool initialize(QQuickWindow* qtWindow);
     Q_INVOKABLE void start();
     Q_INVOKABLE void interrupt();
+
+    // Returns a new session that reconnects with the settings chosen in the
+    // stream menu, or nullptr if no reconnect was requested.
+    Q_INVOKABLE Session* takeRestartSession();
     Q_PROPERTY(QStringList launchWarnings MEMBER m_LaunchWarnings NOTIFY launchWarningsChanged);
 
     static
@@ -124,6 +129,8 @@ public:
     void flushWindowEvents();
 
     void setShouldExit(bool quitHostApp = false);
+
+    void openStreamMenu(bool fromGamepad);
 
 signals:
     void stageStarting(QString stage);
@@ -170,6 +177,19 @@ private:
     void notifyMouseEmulationMode(bool enabled);
 
     void updateOptimalWindowDisplayMode();
+
+    bool handleStreamMenuEvent(const SDL_Event& event);
+
+    void closeStreamMenu();
+
+    StreamMenu::StreamSettings getCurrentStreamSettings();
+
+    StreamMenu::StreamSettings getSavedStreamSettings();
+
+    void applySettings(const StreamMenu::StreamSettings& settings);
+
+    // Saves only the rows in StreamMenu::SettingsRowMask
+    void saveSettings(const StreamMenu::StreamSettings& settings, unsigned rows);
 
     enum class DecoderAvailability {
         None,
@@ -280,7 +300,19 @@ private:
     int m_AudioSampleCount;
     Uint32 m_DropAudioEndTime;
 
+    // Client playback volume in percent, set from the stream menu and read by the audio thread
+    SDL_atomic_t m_AudioVolume;
+
     Overlay::OverlayManager m_OverlayManager;
+
+    StreamMenu m_StreamMenu;
+    bool m_StreamMenuRestoreCapture;
+    StreamingPreferences* m_RestartPreferences;
+
+    // Settings rows (StreamMenu::SettingsRowMask) that were changed by Apply
+    // in an earlier session of this stream, and those to pass to the next one
+    unsigned m_AppliedRows;
+    unsigned m_RestartAppliedRows;
 
     static CONNECTION_LISTENER_CALLBACKS k_ConnCallbacks;
     static Session* s_ActiveSession;

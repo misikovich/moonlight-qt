@@ -103,6 +103,7 @@ private:
 
     SDL_mutex* m_OverlayMutex;
     VAImageFormat m_OverlayFormat;
+    unsigned int m_OverlayFormatFlags;
     Uint32 m_OverlaySdlPixelFormat;
     VAImage m_OverlayImage[Overlay::OverlayMax];
     VASubpictureID m_OverlaySubpicture[Overlay::OverlayMax];

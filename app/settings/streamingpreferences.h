@@ -18,6 +18,13 @@ public:
 
     void reload();
 
+    // Returns a copy of these preferences that is not tied to the global
+    // instance, so it can be modified without affecting saved settings.
+    StreamingPreferences* clone() const;
+
+    // Returns a new instance with the preferences as currently saved
+    static StreamingPreferences* loadSaved();
+
     enum AudioConfig
     {
         AC_STEREO,
@@ -160,7 +167,8 @@ public:
 
     Q_INVOKABLE bool retranslate();
 
-    // Directly accessible members for preferences
+    // Directly accessible members for preferences. Any member that
+    // isn't a writable Q_PROPERTY must be copied manually in clone().
     int width;
     int height;
     int fps;

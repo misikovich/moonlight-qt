@@ -7,12 +7,15 @@ import Session 1.0
 import SystemProperties 1.0
 
 Item {
+    id: streamSegue
+
     property Session session
     property string appName
     property string stageText : isResume ? qsTr("Resuming %1...").arg(appName) :
                                            qsTr("Starting %1...").arg(appName)
     property bool isResume : false
     property bool quitAfter : false
+    property var restartSession : null
 
     function stageStarting(stage)
     {
@@ -61,6 +64,20 @@ Item {
 
     function sessionFinished(portTestResult)
     {
+        // Reconnect if new settings were applied from the stream menu. The new
+        // session starts once this one is cleaned up in sessionReadyForDeletion().
+        var nextSession = session.takeRestartSession()
+        if (nextSession && !streamSegueErrorDialog.text) {
+            restartSession = nextSession
+
+            // Show the Qt window again while we reconnect
+            stageText = qsTr("Resuming %1...").arg(appName)
+            stageSpinner.visible = true
+            stageLabel.visible = true
+            window.visible = true
+            return
+        }
+
         if (portTestResult !== 0 && portTestResult !== -1 && streamSegueErrorDialog.text) {
             streamSegueErrorDialog.text += "\n\n" + qsTr("This PC's Internet connection is blocking Moonlight. Streaming over the Internet may not work while connected to this network.")
         }
@@ -98,6 +115,32 @@ Item {
         // and keeps other libraries (like SDL_TTF) around until it is deleted.
         session = null
         gc()
+
+        if (restartSession) {
+            // The user may have left this view (by pressing Escape) while we were
+            // cleaning up. Don't start streaming over whatever view is shown now.
+            if (StackView.status !== StackView.Active) {
+                // Let the pending session get garbage collected
+                restartSession = null
+                gc()
+
+                // This would have happened in sessionFinished() without a reconnect
+                if (quitAfter) {
+                    Qt.quit()
+                }
+                return
+            }
+
+            var component = Qt.createComponent("StreamSegue.qml")
+            var segue = component.createObject(stackView, {
+                                                   "appName": appName,
+                                                   "session": restartSession,
+                                                   "isResume": true,
+                                                   "quitAfter": quitAfter
+                                               })
+            restartSession = null
+            stackView.replace(streamSegue, segue, StackView.Immediate)
+        }
     }
 
     StackView.onDeactivating: {
@@ -152,8 +195,11 @@ Item {
             // in the hintText control itself to synchronize
             // with Session.exec() which requires no concurrent
             // gamepad usage.
-            hintText.text = qsTr("Tip:") + " " + qsTr("Press %1 to disconnect your session").arg(SdlGamepadKeyNavigation.getConnectedGamepads() > 0 ?
-                                                  qsTr("Start+Select+L1+R1") : qsTr("Ctrl+Alt+Shift+Q"))
+            var hasGamepads = SdlGamepadKeyNavigation.getConnectedGamepads() > 0
+            hintText.text = qsTr("Tip:") + " " + qsTr("Press %1 to disconnect your session").arg(hasGamepads ?
+                                                  qsTr("Start+Select+L1+R1") : qsTr("Ctrl+Alt+Shift+Q")) + "\n" +
+                            qsTr("Press %1 to open the stream menu").arg(hasGamepads ?
+                                                  qsTr("Select+L1+R1+Y") : qsTr("Ctrl+Alt+Shift+O"))
 
             // Stop GUI gamepad usage now
             SdlGamepadKeyNavigation.disable()
@@ -227,6 +273,7 @@ Item {
         anchors.bottomMargin: 50
         anchors.horizontalCenter: parent.horizontalCenter
         font.pointSize: 18
+        horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter
 
         wrapMode: Text.Wrap

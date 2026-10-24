@@ -773,6 +773,7 @@ public:
     virtual int getDecoderColorRange() override;
     virtual void setHdrMode(bool enabled) override;
     virtual void notifyOverlayUpdated(Overlay::OverlayType type) override;
+    virtual bool supportsOverlay(Overlay::OverlayType type) override;
 #ifdef HAVE_EGL
     virtual bool canExportEGL() override;
     virtual AVPixelFormat getEGLImagePixelFormat() override;
@@ -789,7 +790,7 @@ private:
     bool mapDumbBuffer(uint32_t handle, size_t size, void** mapping);
     bool createFbForDumbBuffer(struct drm_mode_create_dumb* createBuf, uint32_t* fbId);
     void enterOverlayCompositionMode();
-    void blitOverlayToCompositionSurface(Overlay::OverlayType type, SDL_Surface* newSurface, SDL_Rect* overlayRect);
+    void composeOverlays(SDL_Rect dirtyRect);
     static bool drmFormatMatchesVideoFormat(uint32_t drmFormat, int videoFormat);
 
     IFFmpegRenderer* m_BackendRenderer;
@@ -816,6 +817,7 @@ private:
     SDL_Surface* m_OverlayCompositionSurface;
     std::mutex m_OverlayLock;
     SDL_Rect m_OverlayRects[Overlay::OverlayMax];
+    SDL_Surface* m_OverlaySurfaces[Overlay::OverlayMax];
     drmVersionPtr m_Version;
     uint32_t m_HdrOutputMetadataBlobId;
     SDL_Rect m_OutputRect;

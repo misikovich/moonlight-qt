@@ -20,6 +20,13 @@ public:
     virtual int getDecoderColorspace() override;
     virtual int getDecoderColorRange() override;
 
+    // MMAL doesn't draw any overlays. The stream menu would be invisible while
+    // capturing input, so report it unsupported. Other overlays keep the
+    // existing behavior of silently not being drawn.
+    virtual bool supportsOverlay(Overlay::OverlayType type) override {
+        return type != Overlay::OverlayStreamMenu;
+    }
+
 private:
     static void InputPortCallback(MMAL_PORT_T* port, MMAL_BUFFER_HEADER_T* buffer);
     bool getDtDeviceStatus(QString name, bool ifUnknown);

@@ -1808,6 +1808,7 @@ Flickable {
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Display real-time stream performance information while streaming.") + "\n\n" +
                                   qsTr("You can toggle it at any time while streaming using Ctrl+Alt+Shift+S or Select+L1+R1+X.") + "\n\n" +
+                                  qsTr("You can also toggle it from the stream menu, which opens with Ctrl+Alt+Shift+O or Select+L1+R1+Y.") + "\n\n" +
                                   qsTr("The performance overlay is not supported on Steam Link or Raspberry Pi.")
                 }
             }

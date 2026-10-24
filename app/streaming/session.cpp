@@ -584,8 +584,14 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_OpusDecoder(nullptr),
       m_AudioRenderer(nullptr),
       m_AudioSampleCount(0),
-      m_DropAudioEndTime(0)
+      m_DropAudioEndTime(0),
+      m_StreamMenu(m_OverlayManager),
+      m_StreamMenuRestoreCapture(false),
+      m_RestartPreferences(nullptr),
+      m_AppliedRows(0),
+      m_RestartAppliedRows(0)
 {
+    SDL_AtomicSet(&m_AudioVolume, 100);
 }
 
 Session::~Session()
@@ -1269,10 +1275,12 @@ private:
 
     void run() override
     {
-        // Only quit the running app if our session terminated gracefully
+        // Only quit the running app if our session terminated gracefully.
+        // Never quit it when we're about to reconnect with new settings.
         bool shouldQuit =
                 !m_Session->m_UnexpectedTermination &&
-                m_Session->m_Preferences->quitAppAfter;
+                m_Session->m_Preferences->quitAppAfter &&
+                m_Session->m_RestartPreferences == nullptr;
 
         // Notify the UI
         if (shouldQuit) {
@@ -1759,6 +1767,245 @@ void Session::setShouldExit(bool quitHostApp)
     m_ShouldExit = true;
 }
 
+void Session::openStreamMenu(bool fromGamepad)
+{
+    if (m_StreamMenu.isOpen()) {
+        return;
+    }
+
+    if (!m_OverlayManager.isOverlaySupported(Overlay::OverlayStreamMenu)) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Stream menu is not supported by the current renderer");
+        return;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Opening stream menu");
+
+    // Input goes to the menu now, so release anything held down on the host
+    m_InputHandler->raiseAllInput();
+
+    // Show the cursor so the menu can be used with the mouse
+    m_StreamMenuRestoreCapture = m_InputHandler->isCaptureActive();
+    if (m_StreamMenuRestoreCapture) {
+        m_InputHandler->setCaptureActive(false);
+    }
+
+    m_StreamMenu.open(m_Window, getCurrentStreamSettings(), getSavedStreamSettings(),
+                      m_OverlayManager.isOverlayEnabled(Overlay::OverlayDebug),
+                      fromGamepad, m_Preferences->swapFaceButtons, m_AppliedRows,
+                      SDL_AtomicGet(&m_AudioVolume));
+}
+
+void Session::closeStreamMenu()
+{
+    m_StreamMenu.close();
+
+    if (m_StreamMenuRestoreCapture) {
+        m_InputHandler->setCaptureActive(true);
+        m_StreamMenuRestoreCapture = false;
+    }
+}
+
+StreamMenu::StreamSettings Session::getCurrentStreamSettings()
+{
+    StreamMenu::StreamSettings settings;
+    settings.width = m_StreamConfig.width;
+    settings.height = m_StreamConfig.height;
+    settings.fps = m_StreamConfig.fps;
+    settings.videoCodecConfig = m_Preferences->videoCodecConfig;
+    return settings;
+}
+
+StreamMenu::StreamSettings Session::getSavedStreamSettings()
+{
+    // Our preferences may contain overrides from the command line
+    StreamingPreferences* saved = StreamingPreferences::loadSaved();
+
+    StreamMenu::StreamSettings settings;
+    settings.width = saved->width;
+    settings.height = saved->height;
+    settings.fps = saved->fps;
+    settings.videoCodecConfig = saved->videoCodecConfig;
+
+    delete saved;
+    return settings;
+}
+
+bool Session::handleStreamMenuEvent(const SDL_Event& event)
+{
+    StreamMenu::Action action;
+    bool consumed = m_StreamMenu.handleEvent(event, action);
+
+    switch (action) {
+    case StreamMenu::Action::None:
+        return consumed;
+
+    case StreamMenu::Action::Close:
+        closeStreamMenu();
+        return consumed;
+
+    case StreamMenu::Action::ToggleStatsOverlay:
+    {
+        // Same as Ctrl+Alt+Shift+S, but the menu stays open
+        bool enabled = !m_OverlayManager.isOverlayEnabled(Overlay::OverlayDebug);
+        m_OverlayManager.setOverlayState(Overlay::OverlayDebug, enabled);
+        m_StreamMenu.refresh();
+        return consumed;
+    }
+
+    case StreamMenu::Action::SetVolume:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Setting client volume to %d%%",
+                    m_StreamMenu.getVolume());
+        SDL_AtomicSet(&m_AudioVolume, m_StreamMenu.getVolume());
+        m_StreamMenu.refresh();
+        return consumed;
+
+    case StreamMenu::Action::QuitStream:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Quitting stream from stream menu");
+        break;
+
+    case StreamMenu::Action::ForceQuitApp:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Quitting host app from stream menu");
+
+        // Like setShouldExit(true), except that Moonlight keeps running
+        // afterwards, so we must not change the global preferences.
+        if (m_Preferences == StreamingPreferences::get()) {
+            m_Preferences = m_Preferences->clone();
+            m_Preferences->setParent(this);
+        }
+        m_Preferences->quitAppAfter = true;
+        break;
+
+    case StreamMenu::Action::ApplySettings:
+        applySettings(m_StreamMenu.getSelectedSettings());
+        break;
+
+    case StreamMenu::Action::SaveSettings:
+    {
+        // Only save what the user changed, since the other rows may
+        // hold values from the command line rather than saved ones.
+        StreamMenu::StreamSettings settings = m_StreamMenu.getSelectedSettings();
+        saveSettings(settings, m_StreamMenu.getChangedRows());
+
+        // No need to reconnect if we're already streaming with these settings
+        if (!m_StreamMenu.hasSettingsChanges()) {
+            m_StreamMenu.setSavedSettings(getSavedStreamSettings());
+            return consumed;
+        }
+
+        applySettings(settings);
+        break;
+    }
+    }
+
+    // All remaining actions end this session
+    m_StreamMenu.close();
+
+    SDL_Event quitEvent;
+    quitEvent.type = SDL_QUIT;
+    quitEvent.quit.timestamp = SDL_GetTicks();
+    SDL_PushEvent(&quitEvent);
+
+    return consumed;
+}
+
+void Session::applySettings(const StreamMenu::StreamSettings& settings)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Reconnecting with new settings: %dx%dx%d (codec config %d)",
+                settings.width, settings.height, settings.fps,
+                (int)settings.videoCodecConfig);
+
+    // The next session uses a copy of our preferences, so any command line
+    // overrides still apply to it and the saved settings are left alone.
+    StreamingPreferences* prefs = m_Preferences->clone();
+    prefs->setParent(this);
+    prefs->width = settings.width;
+    prefs->height = settings.height;
+    prefs->fps = settings.fps;
+    prefs->videoCodecConfig = settings.videoCodecConfig;
+    if (prefs->autoAdjustBitrate) {
+        prefs->bitrateKbps = StreamingPreferences::getDefaultBitrate(prefs->width, prefs->height,
+                                                                     prefs->fps, prefs->enableYUV444);
+    }
+
+    delete m_RestartPreferences;
+    m_RestartPreferences = prefs;
+
+    // Remember what was changed so a later Save in the next session includes it
+    m_RestartAppliedRows = m_AppliedRows | m_StreamMenu.getChangedRows();
+}
+
+void Session::saveSettings(const StreamMenu::StreamSettings& settings, unsigned rows)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Saving stream settings: %dx%dx%d (codec config %d, rows 0x%x)",
+                settings.width, settings.height, settings.fps,
+                (int)settings.videoCodecConfig, rows);
+
+    // We start from the saved preferences rather than our own,
+    // since ours may contain overrides from the command line.
+    StreamingPreferences* saved = StreamingPreferences::loadSaved();
+    StreamingPreferences* global = StreamingPreferences::get();
+
+    // Keep the global preferences (and the settings UI) in sync
+    if (rows & StreamMenu::RowMaskResolution) {
+        saved->width = settings.width;
+        saved->height = settings.height;
+        global->setProperty("width", settings.width);
+        global->setProperty("height", settings.height);
+    }
+    if (rows & StreamMenu::RowMaskFrameRate) {
+        saved->fps = settings.fps;
+        global->setProperty("fps", settings.fps);
+    }
+    if (rows & StreamMenu::RowMaskVideoCodec) {
+        saved->videoCodecConfig = settings.videoCodecConfig;
+        global->setProperty("videoCodecConfig", QVariant::fromValue(settings.videoCodecConfig));
+    }
+
+    // The default bitrate only depends on the resolution and frame rate
+    if (rows & (StreamMenu::RowMaskResolution | StreamMenu::RowMaskFrameRate)) {
+        if (saved->autoAdjustBitrate) {
+            saved->bitrateKbps = StreamingPreferences::getDefaultBitrate(saved->width, saved->height,
+                                                                         saved->fps, saved->enableYUV444);
+        }
+        if (global->autoAdjustBitrate) {
+            global->setProperty("bitrateKbps", StreamingPreferences::getDefaultBitrate(global->width, global->height,
+                                                                                       global->fps, global->enableYUV444));
+        }
+    }
+
+    saved->save();
+    delete saved;
+}
+
+Session* Session::takeRestartSession()
+{
+    if (m_RestartPreferences == nullptr) {
+        return nullptr;
+    }
+
+    // The app is still running on the host, so the next session resumes it
+    {
+        QWriteLocker lock(&m_Computer->lock);
+        m_Computer->currentGameId = m_App.id;
+    }
+
+    Session* session = new Session(m_Computer, m_App, m_RestartPreferences);
+    m_RestartPreferences->setParent(session);
+    m_RestartPreferences = nullptr;
+    session->m_AppliedRows = m_RestartAppliedRows;
+
+    // Keep the volume chosen in the stream menu across the reconnect
+    SDL_AtomicSet(&session->m_AudioVolume, SDL_AtomicGet(&m_AudioVolume));
+    return session;
+}
+
 void Session::start()
 {
     // Wait for any old session to finish cleanup
@@ -2008,6 +2255,11 @@ void Session::exec()
             continue;
         }
 #endif
+        // Input goes to the stream menu while it is open
+        if (m_StreamMenu.isOpen() && handleStreamMenuEvent(event)) {
+            continue;
+        }
+
         switch (event.type) {
         case SDL_QUIT:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -2164,6 +2416,8 @@ void Session::exec()
                         updateOptimalWindowDisplayMode();
                     }
 
+                    // Redraw the stream menu for the new window size
+                    m_StreamMenu.refresh();
                     break;
                 }
             }
@@ -2256,12 +2510,30 @@ void Session::exec()
             m_InputHandler->updatePointerRegionLock();
 
             SDL_UnlockMutex(m_DecoderLock);
+
+            // The new renderer needs the stream menu drawn again, if it can draw it at all
+            if (m_StreamMenu.isOpen()) {
+                if (m_OverlayManager.isOverlaySupported(Overlay::OverlayStreamMenu)) {
+                    m_StreamMenu.refresh();
+                }
+                else {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Closing stream menu, since the new renderer doesn't support it");
+                    closeStreamMenu();
+                }
+            }
             break;
 
         case SDL_KEYUP:
         case SDL_KEYDOWN:
             presence.runCallbacks();
             m_InputHandler->handleKeyEvent(&event.key);
+
+            // Key combos passed through by the stream menu (like toggling
+            // the stats overlay) may change what the menu shows
+            if (event.type == SDL_KEYDOWN && m_StreamMenu.isOpen()) {
+                m_StreamMenu.refresh();
+            }
             break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
